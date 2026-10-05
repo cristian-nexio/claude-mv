@@ -24,16 +24,31 @@ mv claude-mv ~/.local/bin/
 
 ## Usage
 
-First, move your project directory with `mv`, then run `claude-mv` to update
-Claude Code's state:
+Run `claude-mv` with the old and new paths. If the directory hasn't been moved
+yet, claude-mv moves it and updates Claude Code's state in one step:
 
 ```bash
-# Move the directory yourself
-mv ~/projects/myapp ~/work/myapp
-
-# Then update Claude Code's state
 claude-mv ~/projects/myapp ~/work/myapp
 ```
+
+The directory is moved only when `<old-path>` is a directory and `<new-path>`
+doesn't exist yet (its parent must). The move runs after every preflight check
+(active sessions, encoding collisions, readability) and is part of the same
+rollback as the state migration: if any later step fails or is interrupted, the
+directory is moved back.
+
+### Directory already moved
+
+If you already moved the directory (with `mv`, Finder, your IDE, a fresh clone),
+claude-mv just updates Claude Code's state:
+
+```bash
+mv ~/projects/myapp ~/work/myapp
+claude-mv ~/projects/myapp ~/work/myapp
+```
+
+Copy mode (`--copy`, `--from-home`) never touches the directory: copy it first,
+then run `claude-mv --copy`.
 
 ### Auto-detect old path
 
@@ -70,8 +85,10 @@ claude-mv ~/projects/myapp ~/work/myapp --force
 
 ## What It Covers
 
-claude-mv updates all 9 layers of Claude Code's path-dependent state:
+claude-mv updates all 9 layers of Claude Code's path-dependent state, after
+moving the directory itself if it hasn't been moved yet (Layer 0):
 
+0. **The directory itself** -- `<old-path>` -> `<new-path>`, only when not moved yet
 1. **Project directory** -- `~/.claude/projects/<encoded>/` rename and deep merge
 2. **JSONL transcripts** -- `cwd` and `file_path` fields in session logs
 3. **Subagent transcripts** -- stale paths in subagent `.jsonl` and `.meta.json` files
@@ -99,7 +116,8 @@ claude-mv updates all 9 layers of Claude Code's path-dependent state:
 2. **Atomic writes** -- Each file is written to a temporary location and renamed
    into place, so a crash mid-write never leaves a half-written file.
 3. **Rollback** -- If any layer fails or the process is interrupted
-   (SIGINT/SIGTERM), all changes are reverted from the backup automatically.
+   (SIGINT/SIGTERM), all changes are reverted from the backup automatically,
+   including moving the directory back if claude-mv moved it.
 4. **Verification** -- After migration, a residual-path scan checks that no
    old-path references remain.
 

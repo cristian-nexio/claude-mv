@@ -3,6 +3,22 @@
 All notable changes to claude-mv are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **claude-mv moves the directory too when it hasn't been moved yet (Layer 0).**
+  `claude-mv <old> <new>` with `<old>` an existing directory and `<new>` absent now
+  moves the directory and then migrates Claude Code's state, so one command does the
+  whole relocation. Previously this case failed with "New path does not exist (move
+  the repo first, then run claude-mv)". The move runs only after every preflight check
+  passes, inside the migration window, and is reverted by `rollback()` on any later
+  layer failure or SIGINT/SIGTERM. `--dry-run` previews it (and previews Layers 7-8
+  from the directory's current location). The already-moved workflow is unchanged.
+  Refused (nothing touched) when `<new>`'s parent doesn't exist, when `<new>` exists
+  but isn't a directory, in copy mode (`--copy`/`--from-home`), and in single-path
+  auto-detect mode. Warns when the caller's working directory was inside `<old>`.
+
 ## [0.9.0]
 
 ### Added

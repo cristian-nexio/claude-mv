@@ -3,7 +3,7 @@
 updating all path-dependent internal state so --continue, memory,
 and session history keep working.
 
-Usage: claude-mv <old-path> <new-path> [flags]
+Usage: claude-mv <old-path> <new-path> [flags]               # moves the dir too if needed
        claude-mv <new-path> [flags]                       # auto-detect old path
        claude-mv --from-home <src-home> <old> <new>       # cross-account copy
 
@@ -14,6 +14,7 @@ Flags:
   --with-history        copy mode only: also carry the project's history.jsonl lines
 
 Layers updated:
+  0. <old-path> -> <new-path>               the directory itself, if not moved yet
   1. ~/.claude/projects/<encoded>/          directory rename / deep merge / copy
   2. *.jsonl files                          cwd + file_path fields
   3. subagent *.jsonl + *.meta.json         stale paths in subagent transcripts
@@ -766,6 +767,28 @@ def copy_tree_no_overwrite(src: str, dst: str) -> int:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def migrate_layer0_move_directory(old_path: str, new_path: str) -> bool:
+    """Layer 0: Move the project directory itself (only when it hasn't been moved yet).
+
+    Runs inside the migration window so a failure in any later layer — or a
+    SIGINT/SIGTERM — moves the directory back via rollback().
+    """
+    log("Layer 0: Project directory")
+    if dry_run:
+        add_change(0, new_path, f"Would move directory {old_path} -> {new_path}")
+        return True
+    try:
+        shutil.move(old_path, new_path)
+    except OSError as e:
+        err(f"Could not move {old_path} -> {new_path}: {e}")
+        if os.path.isdir(old_path) and os.path.exists(new_path):
+            err(f"A partial copy may remain at {new_path} (source left intact)")
+        return False
+    backup_renames.append((old_path, new_path))
+    add_change(0, new_path, f"Moved directory {old_path} -> {new_path}")
+    return True
+
+
 def migrate_layer1_project_dir(
     old_encoded: str,
     new_encoded: str,
@@ -1195,10 +1218,15 @@ def migrate_layer7_mcp_json(
     old_path: str,
     old_encoded: str,
     new_encoded: str,
+    project_root: str | None = None,
 ) -> bool:
-    """Layer 7: Rewrite absolute paths in .mcp.json."""
+    """Layer 7: Rewrite absolute paths in .mcp.json.
+
+    project_root is where the directory currently lives (defaults to new_path); it
+    differs only in a dry run whose directory move hasn't happened yet.
+    """
     log("Layer 7: .mcp.json")
-    mcp_json = os.path.join(new_path, ".mcp.json")
+    mcp_json = os.path.join(project_root or new_path, ".mcp.json")
     if not os.path.isfile(mcp_json):
         log("  No .mcp.json (OK)")
         return True
@@ -1217,11 +1245,12 @@ def migrate_layer8_settings(
     old_path: str,
     old_encoded: str,
     new_encoded: str,
+    project_root: str | None = None,
 ) -> bool:
-    """Layer 8: Rewrite paths in project settings files."""
+    """Layer 8: Rewrite paths in project settings files (project_root as in Layer 7)."""
     log("Layer 8: Project settings")
     for name in ("settings.json", "settings.local.json"):
-        fpath = os.path.join(new_path, ".claude", name)
+        fpath = os.path.join(project_root or new_path, ".claude", name)
         if not os.path.isfile(fpath):
             continue
         count = rewrite_paths_in_file(fpath, old_path, new_path, old_encoded, new_encoded)
@@ -1366,8 +1395,12 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="claude-mv",
-        description="Move a Claude Code project's internal state to match a new directory location.",
-        epilog="The repo/directory itself must already be at new-path (use mv/cp first, then claude-mv).",
+        description="Move a Claude Code project directory and its internal state to a new location.",
+        epilog=(
+            "If <old-path> exists and <new-path> doesn't, claude-mv moves the directory too. "
+            "If the directory was already moved (mv, Finder, IDE), only the state is updated. "
+            "Copy mode never touches the directory: copy it first, then run claude-mv --copy."
+        ),
     )
     parser.add_argument(
         "paths",
@@ -1453,8 +1486,33 @@ def main() -> None:
             f"Descendant-to-ancestor moves are not supported."
         )
 
-    if not os.path.isdir(new_path):
-        die(f"New path does not exist: {new_path} (move the repo first, then run claude-mv)")
+    # Decide whether claude-mv also moves the directory: only when it plainly hasn't
+    # been moved yet (old is a dir, new doesn't exist) and the caller named both paths.
+    move_dir = False
+    if not os.path.exists(new_path):
+        if copy_mode:
+            die(
+                f"New path does not exist: {new_path} "
+                f"(copy mode never touches the directory — copy it first, then run claude-mv --copy)"
+            )
+        if len(args.paths) != 2 or not os.path.isdir(old_path):
+            die(
+                f"New path does not exist: {new_path} and there is no directory at the old "
+                f"path to move ({old_path})"
+            )
+        new_parent = os.path.dirname(new_path)
+        if not os.path.isdir(new_parent):
+            die(f"Parent of new path does not exist: {new_parent} (create it first)")
+        move_dir = True
+    elif not os.path.isdir(new_path):
+        die(f"New path exists but is not a directory: {new_path}")
+
+    # A shell sitting inside the old directory keeps a stale $PWD after the move.
+    try:
+        cwd_before = os.path.realpath(os.getcwd())
+    except OSError:
+        cwd_before = ""
+    shell_in_old = move_dir and (cwd_before == old_path or cwd_before.startswith(old_path + "/"))
 
     claude_dir = os.path.expanduser("~/.claude")
     if not os.path.isdir(claude_dir):
@@ -1538,8 +1596,9 @@ def main() -> None:
         preflight_history = src_history
     else:
         preflight_history = dst_history
+    # Until Layer 0 runs, the project's own files (.mcp.json, settings) are still at old_path.
     unreadable = preflight_readability(
-        preflight_old_dir, new_path, src_claude_json, preflight_history
+        preflight_old_dir, old_path if move_dir else new_path, src_claude_json, preflight_history
     )
     if unreadable:
         by_category: dict[str, list[str]] = {}
@@ -1628,6 +1687,10 @@ def main() -> None:
             return src_project_dir
         return new_project_dir  # fallback
 
+    # Where the project directory lives while layers 7-8 run: new_path, except in a
+    # dry run whose Layer 0 move is only previewed.
+    project_root = old_path if (move_dir and dry_run) else new_path
+
     migration_in_progress = True
     layer_ok = True
     layers: list[tuple[int, Callable[[], bool]]] = [
@@ -1674,10 +1737,22 @@ def main() -> None:
                 old_path, new_path, src_claude_json, dst_claude_json, cross_account
             ),
         ),
-        (7, lambda: migrate_layer7_mcp_json(new_path, old_path, old_encoded, new_encoded)),
-        (8, lambda: migrate_layer8_settings(new_path, old_path, old_encoded, new_encoded)),
+        (
+            7,
+            lambda: migrate_layer7_mcp_json(
+                new_path, old_path, old_encoded, new_encoded, project_root
+            ),
+        ),
+        (
+            8,
+            lambda: migrate_layer8_settings(
+                new_path, old_path, old_encoded, new_encoded, project_root
+            ),
+        ),
         (9, lambda: migrate_layer9_sessions(old_path, new_path)),
     ]
+    if move_dir:
+        layers.insert(0, (0, lambda: migrate_layer0_move_directory(old_path, new_path)))
     for layer_num, layer_fn in layers:
         try:
             if not layer_fn():
@@ -1713,6 +1788,9 @@ def main() -> None:
             log(f"Source preserved at {old_path} (copy mode — remove it yourself if desired)")
         else:
             warn(f"Old directory still exists at {old_path}")
+
+    if shell_in_old and not dry_run and exit_code == EXIT_OK:
+        warn(f"Your shell's working directory was inside {old_path} — cd to the new location")
 
     if json_mode:
         emit_json_report(exit_code)

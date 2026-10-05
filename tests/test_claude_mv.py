@@ -278,6 +278,102 @@ class TestEndToEnd:
         assert any("~/.claude" in e or ".claude" in e for e in data["errors"])
 
 
+# ── Directory move (Layer 0) ────────────────────────────────────────
+
+
+class TestMoveDirectory:
+    """When <old> exists and <new> doesn't, claude-mv moves the directory too."""
+
+    def _build(self, tmp: str):
+        home = os.path.join(tmp, "home")
+        work = os.path.realpath(os.path.join(tmp, "work"))
+        old_path = os.path.join(work, "my_app")
+        new_path = os.path.join(work, "moved", "my_app")
+        os.makedirs(old_path)
+        os.makedirs(os.path.dirname(new_path))
+        with open(os.path.join(old_path, "README.md"), "w") as f:
+            f.write("hello\n")
+        proj = os.path.join(home, ".claude", "projects", _encode(old_path))
+        os.makedirs(proj)
+        with open(os.path.join(proj, "session.jsonl"), "w") as f:
+            f.write(json.dumps({"cwd": old_path, "type": "user"}) + "\n")
+        return home, old_path, new_path
+
+    def test_moves_directory_and_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mcp = json.dumps({"mcpServers": {"x": {"command": "x", "cwd": "PLACEHOLDER"}}})
+            home, old, new = self._build(tmp)
+            with open(os.path.join(old, ".mcp.json"), "w") as f:
+                f.write(mcp.replace("PLACEHOLDER", old))
+            r = run_in_home(home, old, new, "--json")
+            assert r.returncode == 0, r.stderr
+            data = json.loads(r.stdout)
+            assert any(c["layer"] == 0 for c in data["changes"])
+            assert not os.path.exists(old)
+            with open(os.path.join(new, "README.md")) as f:
+                assert f.read() == "hello\n"
+            with open(os.path.join(new, ".mcp.json")) as f:
+                assert json.load(f)["mcpServers"]["x"]["cwd"] == new
+            proj = os.path.join(home, ".claude", "projects", _encode(new))
+            with open(os.path.join(proj, "session.jsonl")) as f:
+                assert json.loads(f.readline())["cwd"] == new
+
+    def test_dry_run_moves_nothing_but_previews(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new = self._build(tmp)
+            with open(os.path.join(old, ".mcp.json"), "w") as f:
+                f.write(json.dumps({"cwd": old}))
+            r = run_in_home(home, old, new, "--dry-run", "--json")
+            assert r.returncode == 0, r.stderr
+            layers = {c["layer"] for c in json.loads(r.stdout)["changes"]}
+            assert {0, 1, 7} <= layers  # Layer 7 previewed from the old location
+            assert os.path.isdir(old)
+            assert not os.path.exists(new)
+            with open(os.path.join(old, ".mcp.json")) as f:
+                assert json.load(f)["cwd"] == old
+
+    def test_rollback_moves_directory_back(self):
+        # Invalid .mcp.json referencing old path → Layer 7 validation fails → rollback.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new = self._build(tmp)
+            with open(os.path.join(old, ".mcp.json"), "w") as f:
+                f.write('{"cwd": "' + old + '"')
+            r = run_in_home(home, old, new, "--json")
+            assert r.returncode == 4, r.stderr
+            assert os.path.isfile(os.path.join(old, "README.md"))
+            assert not os.path.exists(new)
+            assert os.path.isdir(os.path.join(home, ".claude", "projects", _encode(old)))
+            assert not os.path.exists(os.path.join(home, ".claude", "projects", _encode(new)))
+
+    def test_missing_parent_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, _ = self._build(tmp)
+            new = os.path.join(os.path.dirname(old), "nope", "deeper", "my_app")
+            r = run_in_home(home, old, new, "--json")
+            assert r.returncode == 1
+            assert "Parent of new path does not exist" in json.loads(r.stdout)["errors"][0]
+            assert os.path.isdir(old)
+
+    def test_new_path_that_is_a_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new = self._build(tmp)
+            with open(new, "w") as f:
+                f.write("x")
+            r = run_in_home(home, old, new, "--json")
+            assert r.returncode == 1
+            assert "not a directory" in json.loads(r.stdout)["errors"][0]
+            assert os.path.isdir(old)
+
+    def test_copy_mode_never_moves_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, old, new = self._build(tmp)
+            r = run_in_home(home, old, new, "--copy", "--json")
+            assert r.returncode == 1
+            assert "copy mode" in json.loads(r.stdout)["errors"][0]
+            assert os.path.isdir(old)
+            assert not os.path.exists(new)
+
+
 # ── Readability preflight tests (#2) ─────────────────────────────────
 
 
